@@ -272,8 +272,8 @@ MIT License
 
 ## 👤 作者
 
-- GitHub：[@【你的用户名】](https://github.com/【你的用户名】)
-- Email：【可选】
+- GitHub：[@Jennifer-00](https://github.com/Jennifer-00)
+- Email：1172988148@qq.com
 
 ## 🙏 致谢
 
@@ -281,4 +281,3 @@ MIT License
 - [Mem0](https://mem0.ai/) — 向量记忆层
 - [Zep](https://getzep.com/) — 知识图谱记忆层
 - [Anthropic](https://anthropic.com/) — Claude 模型
-
