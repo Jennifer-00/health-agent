@@ -4,17 +4,8 @@ from typing import List
 from backend.schemas.chat import MemoryItem, MemoryPatchRequest
 from memory.mem0_client import Mem0Client
 from agent.skills.summary_gen import summary_gen
-from agent.skills.memory_consolidate import _consolidate_mem0
 
 router = APIRouter(prefix="/memory", tags=["memory"])
-
-
-@router.post("/consolidate")
-async def consolidate_memories(request: Request):
-    """手动触发记忆整理合并，去除 Mem0 中重复条目。"""
-    user_id: str = request.state.user_id
-    result = await _consolidate_mem0(user_id)
-    return {"ok": True, "result": result}
 
 
 @router.get("/summary")
