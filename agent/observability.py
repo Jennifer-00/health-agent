@@ -141,19 +141,6 @@ def trace_tool_node(trace_id_getter: Callable[[], str]):
             result = await fn(state, *args, **kwargs)
             ms = int((time.monotonic() - t0) * 1000)
 
-            trace_id = trace_id_getter()
-            # tool_executor_node 返回的 tool_events 包含每个工具的信息
-            for event in (result.get("tool_events", []) if isinstance(result, dict) else []):
-                tool_name = event.get("tool", "unknown")
-                summary = event.get("summary", "")
-                mode = "background" if summary == "已在后台写入" else "sync"
-                log_tool_use(
-                    trace_id=trace_id,
-                    tool=tool_name,
-                    ms=ms,          # 整批耗时，单工具粒度由 nodes.py 内部决定
-                    result_len=len(str(summary)),
-                    mode=mode,
-                )
             return result
         return wrapper
     return decorator

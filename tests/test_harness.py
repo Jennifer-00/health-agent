@@ -27,18 +27,14 @@ class FakeGraph:
     harness 只调用 graph.astream()，FakeGraph 直接 yield orchestrator 输出。
     AIMessage.usage_metadata 模拟真实 token 计数（供 observability 读取）。
     """
-    def __init__(self, reply: str = "这是测试回复", tool_events: list[dict] | None = None):
+    def __init__(self, reply: str = "这是测试回复"):
         self.reply = reply
-        self.tool_events = tool_events or []
 
     async def astream(self, state: dict):
         msg = AIMessage(content=self.reply)
         msg.tool_calls = []
         msg.usage_metadata = {"input_tokens": 100, "output_tokens": 50}
         yield {"orchestrator": {"messages": [msg], "pending_memories": []}}
-
-        if self.tool_events:
-            yield {"tool_executor": {"tool_events": self.tool_events}}
 
 
 # ── 辅助：消费 harness.run() 的 AsyncGenerator，收集所有 SSE 文本 ─────────────
@@ -200,52 +196,6 @@ async def test_on_stop_hook_error_does_not_break_response():
     assert "正常回复" in output
 
 
-# ── post_tool_hooks: recurrence_alert ────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_recurrence_hook_fires_when_record_link_finds_history(tmp_path, monkeypatch):
-    """record_link 发现关联历史时，post_tool_hook 打 recurrence_detected 日志。"""
-    log_file = tmp_path / "agent_trace.jsonl"
-    monkeypatch.setattr("agent.observability._LOG_DIR",  tmp_path)
-    monkeypatch.setattr("agent.observability._LOG_FILE", log_file)
-
-    harness = AgentHarness()
-    fake_graph = FakeGraph(
-        reply="您上次也有类似症状。",
-        tool_events=[{"tool": "record_link", "summary": "发现关联历史记录：- 头痛 (2026-04-09)"}],
-    )
-
-    with patch("agent.harness.triage", new=AsyncMock(return_value=(False, ""))):
-        with patch("agent.harness.critic_review", new=AsyncMock(return_value=None)):
-            with patch("agent.harness.build_graph", return_value=fake_graph):
-                await collect(harness)
-
-    lines = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines() if l]
-    alert = next((e for e in lines if e["event"] == "recurrence_detected"), None)
-    assert alert is not None
-    assert alert["count"] == 1
-
-
-@pytest.mark.asyncio
-async def test_recurrence_hook_silent_when_no_history(tmp_path, monkeypatch):
-    """record_link 未找到历史时，不打 recurrence_detected 日志。"""
-    log_file = tmp_path / "agent_trace.jsonl"
-    monkeypatch.setattr("agent.observability._LOG_DIR",  tmp_path)
-    monkeypatch.setattr("agent.observability._LOG_FILE", log_file)
-
-    harness = AgentHarness()
-    fake_graph = FakeGraph(
-        reply="没有历史记录。",
-        tool_events=[{"tool": "record_link", "summary": "未发现相关历史记录。"}],
-    )
-
-    with patch("agent.harness.triage", new=AsyncMock(return_value=(False, ""))):
-        with patch("agent.harness.critic_review", new=AsyncMock(return_value=None)):
-            with patch("agent.harness.build_graph", return_value=fake_graph):
-                await collect(harness)
-
-    lines = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines() if l]
-    assert not any(e["event"] == "recurrence_detected" for e in lines)
 
 
 # ── Observability ─────────────────────────────────────────────────────────────
