@@ -19,16 +19,15 @@ export async function deleteMemory(memoryId: string): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete memory");
 }
 
-export async function consolidateMemories(): Promise<string> {
-  const res = await fetch("/api/memory", { method: "POST" });
-  if (!res.ok) throw new Error("Failed to consolidate memories");
-  const data = await res.json();
-  return data.result ?? "";
+export async function downloadReportPdf(): Promise<void> {
+  const res = await fetch("/api/report/pdf");
+  if (!res.ok) throw new Error("Failed to generate report");
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `health_report_${new Date().toISOString().slice(0, 10)}.pdf`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
-export async function fetchHealthReport(): Promise<string> {
-  const res = await fetch("/api/memory/summary");
-  if (!res.ok) throw new Error("Failed to fetch health report");
-  const data = await res.json();
-  return data.summary ?? "";
-}

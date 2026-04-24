@@ -149,48 +149,7 @@ async def measure_cache():
     return results
 
 
-# ── 3. fire-and-forget 延迟收益 ───────────────────────────────────────────────
-
-async def measure_fire_and_forget():
-    from agent.skills.memory_write import memory_write
-    from agent.skills.memory_search import memory_search
-    TEST_USER = "measure-test-user"
-    TEST_CONTENT = "测量测试：轻微头痛，持续一天"
-
-    print("\n" + "="*60)
-    print("3. fire-and-forget 延迟收益")
-    print("="*60)
-
-    # 模拟同步写入（await 等结果）
-    times_sync = []
-    for _ in range(3):
-        t0 = time.monotonic()
-        await memory_write.ainvoke({"user_id": TEST_USER, "content": TEST_CONTENT, "category": "症状"})
-        times_sync.append((time.monotonic() - t0) * 1000)
-    avg_sync = sum(times_sync) / len(times_sync)
-
-    # 模拟 fire-and-forget（不等写入，立刻返回）
-    times_async = []
-    for _ in range(3):
-        t0 = time.monotonic()
-        task = asyncio.create_task(
-            memory_write.ainvoke({"user_id": TEST_USER, "content": TEST_CONTENT, "category": "症状"})
-        )
-        times_async.append((time.monotonic() - t0) * 1000)
-        await task  # 等任务完成（只是不计入计时）
-
-    avg_async = sum(times_async) / len(times_async)
-    saving_ms = avg_sync - avg_async
-    saving_pct = saving_ms / avg_sync * 100 if avg_sync > 0 else 0
-
-    print(f"  同步写入平均耗时:          {avg_sync:.0f}ms")
-    print(f"  fire-and-forget 感知耗时:  {avg_async:.1f}ms（任务已提交，不阻塞）")
-    print(f"  用户感知延迟节省:           {saving_ms:.0f}ms（{saving_pct:.1f}%）")
-
-    return avg_sync, avg_async
-
-
-# ── 4. 从 JSONL 提取历史 LLM 耗时 ────────────────────────────────────────────
+# ── 3. 从 JSONL 提取历史 LLM 耗时 ────────────────────────────────────────────
 
 def measure_from_logs():
     import json
@@ -244,10 +203,6 @@ def measure_from_logs():
 async def main():
     await measure_triage()
     await measure_cache()
-    try:
-        await measure_fire_and_forget()
-    except Exception as e:
-        print(f"\n  [fire-and-forget 测试跳过: {e}]")
     measure_from_logs()
     print("\n" + "="*60)
     print("测量完成")

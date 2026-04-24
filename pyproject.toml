@@ -17,6 +17,9 @@ dependencies = [
     "zep-cloud>=2.0",
     # Storage
     "redis>=5.0",
+    # PDF export
+    "markdown>=3.6",
+    "playwright>=1.40",
 ]
 
 [project.optional-dependencies]

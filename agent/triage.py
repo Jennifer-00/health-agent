@@ -6,9 +6,13 @@ Triage Gate — Harness 的第一道安全关卡。
 使用 Haiku 保证低延迟（< 500ms）。
 """
 import json
+import logging
+import re
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
+
+logger = logging.getLogger(__name__)
 
 _llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=128)
 
@@ -41,12 +45,13 @@ async def triage(message: str) -> tuple[bool, str]:
         ])
         # Haiku 有时在 JSON 外包 ```json ... ``` 代码块，需剥离后再解析
         raw = resp.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```", 2)[1]          # 取第一个 ``` 之后的内容
-            raw = raw.lstrip("json").strip()       # 去掉可能的语言标识 "json"
-        result = json.loads(raw)
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            logger.warning("[triage] no JSON found in response: %r", raw[:200])
+            return False, ""
+        result = json.loads(m.group())
         if result.get("emergency"):
             return True, _EMERGENCY_RESPONSE
-    except Exception:
-        pass  # 解析失败默认放行，不阻塞正常流程
+    except Exception as exc:
+        logger.warning("[triage] classification failed, defaulting to non-emergency: %s", exc)
     return False, ""
