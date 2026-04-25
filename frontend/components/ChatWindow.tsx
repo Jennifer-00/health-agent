@@ -107,7 +107,16 @@ export default function ChatWindow({ messages, isStreaming, statusText, isConsul
                   prose-p:my-1 prose-ul:my-1 prose-ol:my-1
                   prose-li:my-0.5 prose-strong:font-semibold
                   prose-headings:font-semibold prose-headings:my-2">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      a: ({ href, children }) => (
+                        <a href={href} target="_blank" rel="noopener noreferrer">
+                          {children}
+                        </a>
+                      ),
+                    }}
+                  >
                     {msg.content}
                   </ReactMarkdown>
                 </div>

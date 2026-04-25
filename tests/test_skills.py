@@ -1,36 +1,50 @@
 """skill 单元测试"""
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 @pytest.mark.asyncio
-async def test_memory_write_calls_mem0():
-    with patch("agent.skills.memory_write.Mem0Client") as MockClient:
-        instance = MockClient.return_value
-        instance.add = AsyncMock(return_value={"id": "mem-123"})
+async def test_generate_report_returns_markdown():
+    mock_block = MagicMock()
+    mock_block.text = "# 健康摘要报告\n\n## 症状记录\n- 头痛持续两天"
 
-        from agent.skills.memory_write import memory_write
-        result = await memory_write.ainvoke({
-            "user_id": "user-1",
-            "content": "头痛持续两天",
-            "category": "症状",
-        })
+    with patch("agent.skills.report_gen.scripts.run.Mem0Client") as MockClient, \
+         patch("agent.skills.report_gen.scripts.run.anthropic.Anthropic") as MockAnthropic:
+        MockClient.return_value.get_all = AsyncMock(return_value=[
+            {"memory": "用户头痛持续两天"},
+            {"memory": "用户服用布洛芬"},
+        ])
+        MockAnthropic.return_value.messages.create.return_value.content = [mock_block]
 
-        instance.add.assert_called_once()
-        assert "mem-123" in result
+        from agent.skills.report_gen.scripts.run import generate_report
+        result = await generate_report("user-1")
+
+        assert isinstance(result, str)
+        assert len(result) > 0
+        assert "健康摘要报告" in result
 
 
 @pytest.mark.asyncio
-async def test_memory_search_returns_combined():
-    with patch("agent.skills.memory_search.Mem0Client") as MockMem0, \
-         patch("agent.skills.memory_search.ZepClient") as MockZep:
-        MockMem0.return_value.search = AsyncMock(return_value=[{"content": "头痛记录"}])
-        MockZep.return_value.traverse = AsyncMock(return_value=[])
+async def test_generate_report_no_memories():
+    with patch("agent.skills.report_gen.scripts.run.Mem0Client") as MockClient:
+        MockClient.return_value.get_all = AsyncMock(return_value=[])
 
-        from agent.skills.memory_search import memory_search
-        result = await memory_search.ainvoke({
-            "user_id": "user-1",
-            "query": "头痛",
-        })
+        from agent.skills.report_gen.scripts.run import generate_report
+        result = await generate_report("user-empty")
 
-        assert "头痛记录" in result
+        assert "暂无健康记录" in result
+
+
+@pytest.mark.asyncio
+async def test_generate_report_empty_llm_response():
+    with patch("agent.skills.report_gen.scripts.run.Mem0Client") as MockClient, \
+         patch("agent.skills.report_gen.scripts.run.anthropic.Anthropic") as MockAnthropic:
+        MockClient.return_value.get_all = AsyncMock(return_value=[
+            {"memory": "用户头痛"},
+        ])
+        MockAnthropic.return_value.messages.create.return_value.content = []
+
+        from agent.skills.report_gen.scripts.run import generate_report
+        result = await generate_report("user-1")
+
+        assert "报告生成失败" in result

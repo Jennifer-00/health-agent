@@ -2,111 +2,96 @@
 AgentHarness — Pipeline 编排层。
 
 将 Triage → Main Agent → Critic 三层显式串联，
-并提供 Hook 注册点供横切关注点（日志、Zep 写入等）接入。
+并提供 Hook 注册点供横切关注点（日志、记忆写入等）接入。
 
-Pipeline 流程（参考 Analytics Vidhya Framework/Runtime/Harness 三层模型）：
+Pipeline 流程：
   用户消息
       │
       ▼
   [L1] Triage Gate      ← input guard，Haiku 快速判定，紧急则短路返回
       │ 通过
       ▼
-  pre_llm_hooks         ← 注入上下文（日期已在 orchestrator_node 内部处理）
-      │
-      ▼
-  [L2] Main Agent Graph ← LangGraph Runtime，工具权限在 nodes.py 内部管理
+  [L2] Main Agent Graph ← LangGraph Runtime，工具按需调用（search_memory / search_rag / web_search / generate_report）
       │ 生成回复
-      ▼
-  post_tool_hooks       ← observability 装饰器在 graph 构建时已注入，此处可扩展
-      │
       ▼
   [L3] Critic Review    ← output guard，质检回复合规性
       │
       ▼
-  on_stop_hooks         ← fire-and-forget：Zep 写入、session 持久化
+  on_stop_hooks         ← fire-and-forget：session 持久化、Mem0 写入 + 缓存刷新
       │
       ▼
   最终回复（AsyncGenerator[str, None] → SSE chunks）
-
-设计原则（参考 Anatomy of an Agent Harness）：
-  - "薄控制、厚横切"：不干预 LangGraph 内部 ReAct 循环，专注 guardrails + observability
-  - Harness 本身是 AsyncGenerator，chat.py 只做 transport（HTTP/SSE 转换）
 """
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from typing import Callable, Awaitable
 
-from langchain_core.messages import AIMessage
+logger = logging.getLogger(__name__)
+
+_background_tasks: set[asyncio.Task] = set()
 
 from agent.critic import critic_review
 from agent.graph import build_graph
-from agent.observability import (
-    log_llm_call,
-    log_pipeline_event,
-    log_tool_use,
-    new_trace_id,
-)
+from agent.observability import log_llm_call, log_pipeline_event, new_trace_id
 from agent.triage import triage
+from memory.mem0_client import Mem0Client
 from memory.session_buffer import SessionBuffer
 
 # ── Hook 类型别名 ──────────────────────────────────────────────────────────────
-# pre_llm_hook  : (trace_id, user_message, user_id) -> None
-# post_tool_hook: (trace_id, tool_events) -> None
-# on_stop_hook  : (trace_id, user_message, assistant_text, user_id, session_id) -> Awaitable
 PreLLMHook   = Callable[[str, str, str], None]
 PostToolHook = Callable[[str, list[dict]], None]
 OnStopHook   = Callable[[str, str, str, str, str], Awaitable[None]]
 
-# 工具名 → 前端状态提示文案（从 chat.py 迁移到 harness，属于业务逻辑）
-TOOL_STATUS: dict[str, str] = {
-    "memory_search": "正在查询历史记录…",
-    "memory_write":  "正在写入记忆…",
-    "summary_gen":   "正在生成摘要…",
-}
 
-CHUNK_SIZE = 24
+async def _memory_write_hook(
+    trace_id: str,
+    user_content: str,
+    assistant_text: str,
+    user_id: str,
+    session_id: str,
+) -> None:
+    """写入 Mem0，完成后主动刷新 Redis prefetch 缓存。"""
+    try:
+        client = Mem0Client(user_id=user_id)
+        await client.add(user_content)
+        fresh = await client.search("健康 症状 用药 记录", limit=20)
+        if fresh:
+            await SessionBuffer.set_mem_prefetch(user_id, fresh)
+        log_pipeline_event(trace_id, "memory_write_done", user_id=user_id)
+    except Exception as exc:
+        logger.error("[memory_write_hook] failed user=%r: %s", user_id, exc)
 
 
-def _extract_text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            item if isinstance(item, str)
-            else item.get("text", "") if isinstance(item, dict) and item.get("type") == "text"
-            else ""
-            for item in content
-        )
-    return str(content)
+def _make_task(coro, label: str) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
 
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            logger.warning("[%s] task 被取消，未完成", label)
+            return
+        exc = t.exception()
+        if exc:
+            logger.error("[%s] 执行失败", label, exc_info=exc)
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 class AgentHarness:
-    """
-    Harness 主类。实例化一次后可复用（graph 在首次 run 时懒加载）。
-
-    Hook 列表对外暴露，调用方可在实例化后直接 append：
-        harness.on_stop_hooks.append(zep_write_hook)
-    """
-
     def __init__(self) -> None:
         self.pre_llm_hooks:   list[PreLLMHook]   = []
         self.post_tool_hooks: list[PostToolHook]  = []
-        self.on_stop_hooks:   list[OnStopHook]    = []
-        self._graph = None          # 懒加载，避免模块导入时就初始化 LLM
+        self.on_stop_hooks:   list[OnStopHook]    = [_memory_write_hook]
+        self._graph = None
 
-    # ── 内部：graph 懒加载 ────────────────────────────────────────────────────
     def _get_graph(self):
-        """
-        编译后的 CompiledStateGraph 是无状态的，模块生命周期内复用一个实例。
-        Observability 通过读取 astream 输出（AIMessage.usage_metadata）实现，
-        不修改 graph 节点内部——这是真正意义上的非侵入式 instrumentation。
-        """
         if self._graph is None:
             self._graph = build_graph()
         return self._graph
 
-    # ── 主入口：pipeline run ───────────────────────────────────────────────────
     async def run(
         self,
         user_message: str,
@@ -115,10 +100,6 @@ class AgentHarness:
         history: list[dict],
         original_user_content: str | None = None,
     ) -> AsyncGenerator[str, None]:
-        """
-        执行完整 pipeline，yield SSE JSON 字符串。
-        chat.py 只需 async for chunk in harness.run(...): yield chunk
-        """
         return self._run_pipeline(
             user_message, user_id, session_id, history, original_user_content
         )
@@ -132,8 +113,7 @@ class AgentHarness:
         original_user_content: str | None,
     ) -> AsyncGenerator[str, None]:
         trace_id = new_trace_id()
-        log_pipeline_event(trace_id, "pipeline_start",
-                           user_id=user_id, session_id=session_id)
+        log_pipeline_event(trace_id, "pipeline_start", user_id=user_id, session_id=session_id)
 
         # ── L1: Triage Gate ───────────────────────────────────────────────────
         log_pipeline_event(trace_id, "triage_start")
@@ -141,15 +121,12 @@ class AgentHarness:
         log_pipeline_event(trace_id, "triage_done", emergency=is_emergency)
 
         if is_emergency:
-            # 专用事件类型，前端据此弹模态框而不是走普通消息流
             yield _sse({"type": "emergency", "text": emergency_response})
             yield _sse({"type": "done"})
             log_pipeline_event(trace_id, "pipeline_end", exit="triage_short_circuit")
             save_content = original_user_content or user_message
             for hook in self.on_stop_hooks:
-                asyncio.create_task(
-                    _safe_hook(hook, trace_id, save_content, emergency_response, user_id, session_id)
-                )
+                _make_task(_safe_hook(hook, trace_id, save_content, emergency_response, user_id, session_id), "on_stop_hook")
             return
 
         # ── pre_llm_hooks ─────────────────────────────────────────────────────
@@ -163,72 +140,77 @@ class AgentHarness:
         log_pipeline_event(trace_id, "agent_start")
         graph = self._get_graph()
         conversation = history + [{"role": "user", "content": user_message}]
-
-        # Context 层：检查 memory_search 冷却状态
-        session_buf = SessionBuffer(session_id=session_id)
-        cooldown = await session_buf.get_mem_search_cooldown()
-        skip_memory_search = cooldown > 0
-        if skip_memory_search:
-            await session_buf.decrement_mem_search_cooldown()
-            log_pipeline_event(trace_id, "mem_search_cooldown", remaining=cooldown)
-
         assistant_text = ""
-        mem_search_requested = False  # 追踪本轮是否有 memory_search 被 LLM 请求
+        tool_events_from_graph: list[dict] = []
+        _last_usage: dict = {}
+        _web_sources: list[tuple[str, str]] = []
 
-        async for chunk in graph.astream({
-            "messages": conversation,
-            "user_id": user_id,
-            "pending_memories": [],
-            "skip_memory_search": skip_memory_search,
-        }):
-            for node_name, node_output in chunk.items():
-                if node_output is None:
-                    continue
+        async for event in graph.astream_events(
+            {"messages": conversation, "user_id": user_id, "tool_events": []},
+            version="v2",
+        ):
+            kind = event["event"]
 
-                if node_name == "orchestrator":
-                    pending  = node_output.get("pending_memories", [])
-                    messages = node_output.get("messages", [])
-
-                    # 冷却硬拦截：LLM 请求了 memory_search 但冷却仍活跃，直接过滤掉
-                    # 软提示（skip_memory_search 注入 prompt）不够可靠，LLM 会无视
-                    if skip_memory_search:
-                        pending = [c for c in pending if c.get("name") != "memory_search"]
-                        node_output["pending_memories"] = pending
-
-                    if any(c.get("name") == "memory_search" for c in pending):
-                        mem_search_requested = True
-
-                    for call in pending:
-                        status = TOOL_STATUS.get(call.get("name", ""), f"正在执行 {call.get('name')}…")
-                        yield _sse({"type": "status", "text": status})
-
-                    if messages:
-                        last = messages[-1]
-                        if isinstance(last, AIMessage) and not last.tool_calls:
-                            assistant_text = _extract_text(last.content)
-
-                        # cognitive 面：从 AIMessage.usage_metadata 提取 token 数
-                        # 非侵入式——直接读 astream 输出，不 wrap graph 节点
-                        meta = getattr(last, "usage_metadata", None) or {}
-                        tools_req = [tc["name"] for tc in (getattr(last, "tool_calls", None) or [])]
-                        log_llm_call(
-                            trace_id=trace_id,
-                            node="orchestrator",
-                            tokens_input=meta.get("input_tokens", 0),
-                            tokens_output=meta.get("output_tokens", 0),
-                            ms=0,   # astream 模式下单节点耗时不可直接获取，记 0
-                            tools_requested=tools_req,
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                # 跳过工具调用轮次，只流出纯文本 token
+                if not chunk.tool_call_chunks and chunk.content:
+                    content = chunk.content
+                    if isinstance(content, str):
+                        token = content
+                    elif isinstance(content, list):
+                        token = "".join(
+                            block.get("text", "")
+                            for block in content
+                            if isinstance(block, dict) and block.get("type") == "text"
                         )
+                    else:
+                        token = ""
+                    if token:
+                        assistant_text += token
+                        yield _sse({"type": "text", "delta": token})
 
-                elif node_name == "tool_executor":
-                    if mem_search_requested:
-                        mem_search_requested = False
-                        await session_buf.set_mem_search_cooldown()
-                        log_pipeline_event(trace_id, "mem_search_cooldown_reset")
+            elif kind == "on_chain_end" and event.get("name") == "orchestrator":
+                state_out = event["data"].get("output", {})
+                _web_sources = state_out.get("web_sources", [])
 
-                    yield _sse({"type": "status", "text": "正在生成回复…"})
+            elif kind == "on_chat_model_end":
+                output = event["data"].get("output")
+                # 当 LLM 决定调用工具时（有 tool_calls），立即发出工具事件
+                tool_calls = getattr(output, "tool_calls", None) or []
+                for tc in tool_calls:
+                    tool_name = tc.get("name", "")
+                    args = tc.get("args", {})
+                    query = args.get("query", "") if isinstance(args, dict) else ""
+                    summary = f"查询：{query}" if query else tool_name
+                    tool_events_from_graph.append({"tool": tool_name, "summary": summary})
+                    yield _sse({"type": "tool_call", "tool": tool_name, "summary": summary})
+                meta = getattr(output, "usage_metadata", None) or {}
+                if meta:
+                    _last_usage = meta
 
+        log_llm_call(
+            trace_id=trace_id,
+            node="orchestrator",
+            tokens_input=_last_usage.get("input_tokens", 0),
+            tokens_output=_last_usage.get("output_tokens", 0),
+            ms=0,
+            tools_requested=[e["tool"] for e in tool_events_from_graph],
+        )
         log_pipeline_event(trace_id, "agent_done", reply_len=len(assistant_text))
+
+        # ── web_search 来源追加 ───────────────────────────────────────────────
+        if _web_sources:
+            seen: set[str] = set()
+            items = []
+            for title, url in _web_sources:
+                if url not in seen:
+                    seen.add(url)
+                    items.append(f"- [{title}]({url})")
+            if items:
+                sources_delta = "\n\n---\n\n**参考来源**\n" + "\n".join(items)
+                assistant_text += sources_delta
+                yield _sse({"type": "text", "delta": sources_delta})
 
         # ── L3: Critic Review ─────────────────────────────────────────────────
         log_pipeline_event(trace_id, "critic_start")
@@ -237,18 +219,14 @@ class AgentHarness:
 
         if note:
             assistant_text = f"{assistant_text}\n\n{note}"
+            yield _sse({"type": "text", "delta": f"\n\n{note}"})
 
-        # ── 流出最终回复 ──────────────────────────────────────────────────────
-        for start in range(0, len(assistant_text), CHUNK_SIZE):
-            yield _sse({"type": "text", "delta": assistant_text[start:start + CHUNK_SIZE]})
         yield _sse({"type": "done"})
 
-        # ── on_stop_hooks（fire-and-forget，Zep 写入等副作用在此注册）─────────
+        # ── on_stop_hooks ─────────────────────────────────────────────────────
         save_content = original_user_content or user_message
         for hook in self.on_stop_hooks:
-            asyncio.create_task(
-                _safe_hook(hook, trace_id, save_content, assistant_text, user_id, session_id)
-            )
+            _make_task(_safe_hook(hook, trace_id, save_content, assistant_text, user_id, session_id), "on_stop_hook")
 
         log_pipeline_event(trace_id, "pipeline_end", exit="normal")
 
@@ -261,9 +239,7 @@ def _sse(payload: dict) -> str:
 
 
 async def _safe_hook(hook: OnStopHook, *args) -> None:
-    """包一层 try/except，hook 报错不影响已完成的回复。"""
     try:
         await hook(*args)
     except Exception as exc:
-        # on_stop_hook 失败只记录，不抛出
-        print(f"[harness] on_stop_hook error: {exc}")
+        logger.error("[safe_hook] error: %s", exc)

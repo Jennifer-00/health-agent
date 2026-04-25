@@ -3,17 +3,8 @@ from typing import List
 
 from backend.schemas.chat import MemoryItem, MemoryPatchRequest
 from memory.mem0_client import Mem0Client
-from agent.skills.summary_gen import summary_gen
 
 router = APIRouter(prefix="/memory", tags=["memory"])
-
-
-@router.get("/summary")
-async def get_summary(request: Request):
-    """直接调用 summary_gen 逻辑，返回结构化健康摘要文本。"""
-    user_id: str = request.state.user_id
-    text = await summary_gen.ainvoke({"user_id": user_id})
-    return {"user_id": user_id, "summary": text}
 
 
 @router.get("", response_model=List[MemoryItem])
@@ -28,12 +19,12 @@ async def list_memories(request: Request):
         MemoryItem(
             id=m["id"],
             content=m["memory"],
-            category=m.get("metadata", {}).get("category"),
+            category=(m.get("metadata") or {}).get("category"),
             record_date=None,
             source="mem0",
         )
         for m in memories
-        if m.get("memory")
+        if m and m.get("memory")
     ]
 
 
@@ -54,7 +45,11 @@ async def patch_memory(memory_id: str, body: MemoryPatchRequest, request: Reques
 
     if body.action == "delete":
         await client.delete(memory_id)
-    elif body.action == "update" and body.content:
+    elif body.action == "update":
+        if not body.content:
+            raise HTTPException(status_code=422, detail="update action requires content")
         await client.update(memory_id, body.content)
+    else:
+        raise HTTPException(status_code=422, detail=f"unknown action: {body.action!r}")
 
     return {"ok": True}

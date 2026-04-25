@@ -11,9 +11,13 @@ Critic Agent — Harness 的质量审查层。
 使用 Haiku 保证低延迟。
 """
 import json
+import logging
+import re
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
+
+logger = logging.getLogger(__name__)
 
 _llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=128)
 
@@ -40,11 +44,15 @@ async def critic_review(user_message: str, assistant_response: str) -> str | Non
             HumanMessage(content=content),
         ])
         raw = resp.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```", 2)[1].lstrip("json").strip()
-        result = json.loads(raw)
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            logger.warning("[critic] no JSON found in response: %r", raw[:200])
+            return None
+        result = json.loads(m.group())
         if not result.get("pass") and result.get("note"):
+            from agent.critic_store import write_failure
+            write_failure(user_message, assistant_response, result["note"])
             return result["note"]
-    except Exception:
-        pass  # 审查失败不影响主流程
+    except Exception as exc:
+        logger.warning("[critic] review failed: %s", exc)
     return None
