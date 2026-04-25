@@ -310,9 +310,36 @@ async def _generate_report(user_id: str = "") -> str:
 
 
 async def _web_search(query: str) -> str:
-    # TODO: 接入搜索服务（Brave Search / Tavily / SerpAPI 等）
-    logger.info("[web_search] query=%r (placeholder)", query)
-    return f'[web_search 占位] 未查到与 "{query}" 相关的网络内容，请依据已有知识作答。'
+    import httpx
+    api_key = os.getenv("BRAVE_API_KEY", "")
+    if not api_key:
+        logger.warning("[web_search] BRAVE_API_KEY 未配置，query=%r", query)
+        return f'[web_search] 搜索服务未配置，无法查询 "{query}"。'
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": api_key,
+                },
+                params={"q": query, "count": 5, "search_lang": "zh-hans"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        results = data.get("web", {}).get("results", [])
+        if not results:
+            return f'[web_search] 未找到与 "{query}" 相关的结果。'
+        parts = [
+            f"**[{r['title']}]({r['url']})**\n{r.get('description', '')}"
+            for r in results[:5]
+        ]
+        logger.info("[web_search] query=%r returned=%d", query, len(results))
+        return "\n\n".join(parts)
+    except Exception as exc:
+        logger.error("[web_search] failed query=%r: %s", query, exc)
+        return f'[web_search] 搜索失败，请依据已有知识作答。'
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────

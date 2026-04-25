@@ -143,6 +143,7 @@ class AgentHarness:
         assistant_text = ""
         tool_events_from_graph: list[dict] = []
         _last_usage: dict = {}
+        _web_sources: list[tuple[str, str]] = []
 
         async for event in graph.astream_events(
             {"messages": conversation, "user_id": user_id, "tool_events": []},
@@ -169,16 +170,21 @@ class AgentHarness:
                         assistant_text += token
                         yield _sse({"type": "text", "delta": token})
 
-            elif kind == "on_tool_start":
-                tool_name = event["name"]
-                args = event["data"].get("input", {})
-                query = args.get("query", "") if isinstance(args, dict) else ""
-                summary = f"查询：{query}" if query else tool_name
-                tool_events_from_graph.append({"tool": tool_name, "summary": summary})
-                yield _sse({"type": "tool_call", "tool": tool_name, "summary": summary})
+            elif kind == "on_chain_end" and event.get("name") == "orchestrator":
+                state_out = event["data"].get("output", {})
+                _web_sources = state_out.get("web_sources", [])
 
             elif kind == "on_chat_model_end":
                 output = event["data"].get("output")
+                # 当 LLM 决定调用工具时（有 tool_calls），立即发出工具事件
+                tool_calls = getattr(output, "tool_calls", None) or []
+                for tc in tool_calls:
+                    tool_name = tc.get("name", "")
+                    args = tc.get("args", {})
+                    query = args.get("query", "") if isinstance(args, dict) else ""
+                    summary = f"查询：{query}" if query else tool_name
+                    tool_events_from_graph.append({"tool": tool_name, "summary": summary})
+                    yield _sse({"type": "tool_call", "tool": tool_name, "summary": summary})
                 meta = getattr(output, "usage_metadata", None) or {}
                 if meta:
                     _last_usage = meta
@@ -192,6 +198,19 @@ class AgentHarness:
             tools_requested=[e["tool"] for e in tool_events_from_graph],
         )
         log_pipeline_event(trace_id, "agent_done", reply_len=len(assistant_text))
+
+        # ── web_search 来源追加 ───────────────────────────────────────────────
+        if _web_sources:
+            seen: set[str] = set()
+            items = []
+            for title, url in _web_sources:
+                if url not in seen:
+                    seen.add(url)
+                    items.append(f"- [{title}]({url})")
+            if items:
+                sources_delta = "\n\n---\n\n**参考来源**\n" + "\n".join(items)
+                assistant_text += sources_delta
+                yield _sse({"type": "text", "delta": sources_delta})
 
         # ── L3: Critic Review ─────────────────────────────────────────────────
         log_pipeline_event(trace_id, "critic_start")

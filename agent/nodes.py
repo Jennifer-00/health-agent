@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import date
 
 from langchain_anthropic import ChatAnthropic
@@ -39,6 +40,7 @@ async def orchestrator_node(state: AgentState) -> dict:
     messages = list(state["messages"])
     response = None
     tool_events: list[dict] = []
+    web_sources: list[tuple[str, str]] = []   # (title, url) from web_search results
 
     for _round in range(_MAX_TOOL_ROUNDS):
         response = await _llm_with_tools.ainvoke([system] + messages)
@@ -51,8 +53,22 @@ async def orchestrator_node(state: AgentState) -> dict:
         messages.append(response)
         tool_results: list[ToolMessage] = []
         for tc in response.tool_calls:
-            result, is_error = await dispatch_tool(tc["name"], tc["args"], user_id=state.get("user_id", ""))
-            query = tc["args"].get("query", "")
+            try:
+                result, is_error = await dispatch_tool(tc["name"], tc["args"], user_id=state.get("user_id", ""))
+            except Exception as exc:
+                # dispatch_tool 自身有 try/except，此处作为最后一道防线：
+                # 单个工具意外抛出时不中断本轮其余工具调用
+                logger.error(
+                    "[orchestrator] dispatch_tool unexpected error round=%d tool=%s: %s",
+                    _round, tc["name"], exc, exc_info=True,
+                )
+                result, is_error = f"工具 {tc['name']} 执行异常，请根据已有知识作答。", True
+
+            if tc["name"] == "web_search" and not is_error:
+                for title, url in re.findall(r'\*\*\[([^\]]+)\]\(([^)]+)\)\*\*', result):
+                    web_sources.append((title, url))
+
+            query = tc["args"].get("query", "") if isinstance(tc["args"], dict) else ""
             tool_events.append({
                 "tool": tc["name"],
                 "summary": f"查询：{query}" if query else tc["name"],
@@ -74,5 +90,5 @@ async def orchestrator_node(state: AgentState) -> dict:
             _MAX_TOOL_ROUNDS,
         )
 
-    # 只将最终文本回复写入 LangGraph state；tool_events 供 harness 发送 SSE
-    return {"messages": [response], "tool_events": tool_events}
+    # 只将最终文本回复写入 LangGraph state；tool_events/web_sources 供 harness 发送 SSE
+    return {"messages": [response], "tool_events": tool_events, "web_sources": web_sources}

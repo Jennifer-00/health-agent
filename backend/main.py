@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from backend.routers import chat, memory, report
+from backend.routers import chat, memory, report, notify
 from backend.middleware.auth import AuthMiddleware
 from memory.mem0_client import Mem0Client
 from backend.routers.chat import _warmup_task
@@ -41,6 +41,10 @@ async def _startup_warmup():
 async def lifespan(app: FastAPI):
     import asyncio
     asyncio.create_task(_startup_warmup())
+
+    from agent.alert_monitor import run_alert_monitor
+    scheduler.add_job(run_alert_monitor, "interval", hours=6, id="health_alert_monitor")
+
     scheduler.start()
 
     yield
@@ -72,6 +76,7 @@ app.add_middleware(AuthMiddleware)
 app.include_router(chat.router)
 app.include_router(memory.router)
 app.include_router(report.router)
+app.include_router(notify.router)
 
 
 @app.get("/health")
