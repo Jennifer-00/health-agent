@@ -9,12 +9,12 @@ import json
 import logging
 import re
 
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
 
-_llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=128)
+_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=128)
 
 _TRIAGE_PROMPT = """你是医疗紧急情况分诊系统。判断用户消息是否包含需要立即就医的紧急症状。
 

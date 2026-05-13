@@ -1,3 +1,43 @@
+from agent.intent import (
+    SYMPTOM_REPORT, MEDICATION_CONSULT, ALLERGY,
+    CHRONIC_FOLLOWUP, LIFESTYLE, RECORD_UPDATE, MEMORY_QUERY,
+)
+
+# 每个意图对应一段注入 <strategy> 标签的操作指引，2–4 句话
+INTENT_STRATEGY: dict[str, str] = {
+    SYMPTOM_REPORT: (
+        "用户正在描述症状。先调用 search_memory 与历史记录对比，判断是否为反复发作或新发症状。"
+        "评估症状的严重程度和危险信号。回复结尾提示用户是否需要记录本次症状。"
+    ),
+    MEDICATION_CONSULT: (
+        "用户在咨询用药问题。必须对照 user_profile 中的过敏史和当前用药逐条核查，"
+        "明确说明有无禁忌或相互作用。同时调用 search_rag 或 web_search 获取权威药物信息，"
+        "不得仅凭训练知识作答。"
+    ),
+    ALLERGY: (
+        "用户描述了疑似过敏或不良反应。第一步判断严重程度：有呼吸困难/喉头水肿/血压下降迹象时"
+        "立即提示拨打 120，不等工具返回。中轻度情况对照 user_profile 确认是否为已知过敏原，"
+        "给出停药和就医时机建议。"
+    ),
+    CHRONIC_FOLLOWUP: (
+        "用户汇报了健康指标数值（血糖/血压/心率等）。必须先调用 search_memory 检索该指标的"
+        "历史记录，将今日数值与历史数值横向对比并判断趋势（改善/稳定/恶化）。"
+        "参照正常阈值说明是否超标及超标幅度。回复结尾提示用户记录今日数值。"
+    ),
+    LIFESTYLE: (
+        "用户寻求生活方式建议。必须先调用 search_memory 了解用户的慢性病史和用药情况，"
+        "给出的建议要与其具体情况相符，不得出现与其禁忌冲突的通用建议。"
+    ),
+    RECORD_UPDATE: (
+        "用户主动要求记录信息。在回复中先完整复述要记录的内容（让用户确认无误），"
+        "然后告知已写入健康档案。若涉及过敏或用药，提醒用户下次就医时告知医生。"
+    ),
+    MEMORY_QUERY: (
+        "用户在查询历史记录。优先调用 search_memory 获取数据，按时间倒序呈现检索结果。"
+        "不得补充未经工具查询的信息；若记录为空，如实告知并建议用户补录。"
+    ),
+}
+
 INTAKE_PROMPT = """你是一位专业的问诊助手。通过自然对话收集用户的症状信息。
 
 <rules>

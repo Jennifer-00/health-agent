@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-import anthropic
+from openai import OpenAI
 
 from memory.mem0_client import Mem0Client
 from agent.skills.report_gen.scripts.formatter import format_report
@@ -66,17 +66,22 @@ async def generate_report(user_id: str) -> str:
 
 请按格式规范生成健康摘要报告。"""
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    message = client.messages.create(
-        model=os.getenv("REPORT_MODEL", "claude-haiku-4-5-20251001"),
+    client = OpenAI(
+        api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+        base_url="https://api.deepseek.com",
+    )
+    response = client.chat.completions.create(
+        model=os.getenv("REPORT_MODEL", "deepseek-chat"),
         max_tokens=2048,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
     )
 
-    if not message.content or not hasattr(message.content[0], "text"):
+    raw = response.choices[0].message.content or ""
+    if not raw.strip():
         return "# 健康摘要报告\n\n> 报告生成失败：模型返回内容为空，请稍后重试。"
-    raw = message.content[0].text
     return format_report(raw)
 
 

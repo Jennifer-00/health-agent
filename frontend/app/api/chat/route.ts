@@ -13,7 +13,7 @@ export async function POST(req: Request): Promise<Response> {
     headers: {
       "Content-Type": contentType,
     },
-  });
+  }, req);
 
   if (!upstream.body) {
     return new Response(

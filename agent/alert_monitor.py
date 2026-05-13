@@ -31,7 +31,7 @@ _ALERT_QUERIES = [
 
 async def _fetch_alerts() -> list[dict]:
     """用 web_search 搜索预警信息，用 Haiku 解析成结构化列表。"""
-    import anthropic as _anthropic
+    from openai import AsyncOpenAI
     from agent.tools import _web_search
 
     snippets: list[str] = []
@@ -43,9 +43,9 @@ async def _fetch_alerts() -> list[dict]:
     if not snippets:
         return []
 
-    client = _anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = await client.messages.create(
-        model="claude-haiku-4-5-20251001",
+    client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=1024,
         messages=[{
             "role": "user",
@@ -58,7 +58,7 @@ async def _fetch_alerts() -> list[dict]:
         }],
     )
 
-    raw = response.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
     start, end = raw.find("["), raw.rfind("]") + 1
     if start == -1 or end == 0:
         return []
@@ -101,7 +101,8 @@ async def _is_relevant(alert: dict, user_id: str) -> bool:
     try:
         results = await Mem0Client(user_id=user_id).search(" ".join(keywords), limit=3)
         return len(results) > 0
-    except Exception:
+    except Exception as exc:
+        logger.warning("[alert_monitor] _is_relevant failed user=%r keywords=%r: %s", user_id, keywords, exc)
         return False
 
 
@@ -118,9 +119,11 @@ async def run_alert_monitor() -> None:
     logger.info("[alert_monitor] 解析到 %d 条预警", len(alerts))
 
     try:
-        from memory.mem0_client import _mem
-        resp = await _mem.users()
-        users = resp if isinstance(resp, list) else resp.get("results", [])
+        from memory.mem0_client import list_users
+        users = await list_users()
+        if not users:
+            logger.info("[alert_monitor] OSS 模式无用户列表，跳过主动推送")
+            return
     except Exception as exc:
         logger.error("[alert_monitor] 获取用户列表失败: %s", exc)
         return

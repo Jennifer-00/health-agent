@@ -9,18 +9,21 @@ dependencies = [
     "pyjwt>=2.8",
     # Agent
     "langgraph>=0.2",
-    "langchain-anthropic>=0.1",
-    "anthropic>=0.28",
+    "langchain-openai>=0.1",
+    "openai>=1.0",
     # Memory
     "mem0ai>=0.1",
     "graphiti-core>=0.3",
     "zep-cloud>=2.0",
     # Storage
     "redis>=5.0",
+    "aiosqlite>=0.20",
+    "sentence-transformers>=3.0",
+    "langchain-neo4j>=0.9",
+    "rank-bm25>=0.2",
     "httpx>=0.27",
     # PDF export
     "markdown>=3.6",
-    "playwright>=1.40",
 ]
 
 [project.optional-dependencies]

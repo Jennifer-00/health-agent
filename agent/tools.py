@@ -323,10 +323,10 @@ async def _search_rag(query: str) -> str:
         return "[RAG] 本地知识库检索失败，请改用 web_search 工具补充检索。"
 
 
-async def _search_memory(query: str, user_id: str = "") -> str:
+async def _search_memory(query: str, user_id: str = "", limit: int = 5) -> str:
     try:
         try:
-            memories = await Mem0Client(user_id=user_id).search(query, limit=5)
+            memories = await Mem0Client(user_id=user_id).search(query, limit=limit)
         except asyncio.TimeoutError:
             logger.warning("[search_memory] Mem0 超时，降级 prefetch user=%r", user_id)
             memories = await SessionBuffer.get_mem_prefetch(user_id) or []

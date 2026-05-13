@@ -5,10 +5,16 @@ const BACKEND_BASE_URL = process.env.BACKEND_BASE_URL ?? "http://127.0.0.1:8000"
 export async function proxyToBackend(
   path: string,
   init: RequestInit = {},
+  req?: Request,
 ): Promise<Response> {
-  const token = createDevJwt();
   const headers = new Headers(init.headers);
-  headers.set("Authorization", `Bearer ${token}`);
+
+  const clientAuth = req?.headers.get("authorization");
+  if (clientAuth) {
+    headers.set("Authorization", clientAuth);
+  } else {
+    headers.set("Authorization", `Bearer ${createDevJwt()}`);
+  }
 
   return fetch(`${BACKEND_BASE_URL}${path}`, {
     ...init,
