@@ -28,6 +28,15 @@ frontend/node_modules/
 # Runtime artifacts
 logs/
 *.jsonl
+data/
+evals/results/
+report/
+
+# Browser testing artifacts
+.playwright-mcp/
+
+# Build artifacts
+*.tsbuildinfo
 
 # 系统文件
 .DS_Store

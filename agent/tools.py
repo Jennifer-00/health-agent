@@ -48,7 +48,11 @@ TOOL_SPECS: list[dict] = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "检索关键词，简洁描述要查找的历史信息",
+                    "description": (
+                        "检索关键词，简洁描述要查找的历史信息。"
+                        "必须是自包含的完整描述，不能含'那个''之前''上次'等未解析指代，"
+                        "需先从对话历史中确定具体症状或事件再填入。"
+                    ),
                 }
             },
             "required": ["query"],
@@ -79,7 +83,13 @@ TOOL_SPECS: list[dict] = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "检索查询语句，简洁描述所需信息",
+                    "description": (
+                        "检索查询语句，必须是自包含的完整医学术语查询，不能含未解析的指代词。"
+                        "填写前先消解上下文中的指代：若用户说'那个药''之前说的药'，"
+                        "必须先从对话历史中确定具体药物名称，再填入 query。"
+                        "例：用户说'上次那个药有副作用吗'且上文提到布洛芬，"
+                        "应填'布洛芬 不良反应 胃肠道'，而非'那个药副作用'。"
+                    ),
                 }
             },
             "required": ["query"],
@@ -115,22 +125,55 @@ _EMBED_MODEL    = "BAAI/bge-m3"
 # 与 eval_retrieval.py 保持一致的 query 指令前缀
 _QUERY_PREFIX   = "为这个句子生成表示以用于检索相关文章："
 _PREFETCH_LIMIT = 20   # 每路 Prefetch 候选数（与 eval 脚本一致）
-_TOP_K          = 5    # RRF 后最终返回条数
+_RERANK_POOL    = 20   # RRF 后送入 cross-encoder 的候选数
+_TOP_K          = 5    # cross-encoder 重排后最终返回条数
+_RERANK_MODEL   = "BAAI/bge-reranker-v2-m3"
 
 
 # ── Lazy 单例 ─────────────────────────────────────────────────────────────────
 
-_embed_model  = None
+_embed_model   = None
 _qdrant_client = None
+_reranker      = None
+
+
+def _get_embed_device() -> str:
+    device = os.getenv("EMBED_DEVICE")
+    if device:
+        return device
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 
 def _get_embed_model():
     global _embed_model
     if _embed_model is None:
         from FlagEmbedding import BGEM3FlagModel
-        _embed_model = BGEM3FlagModel(_EMBED_MODEL, use_fp16=True)
-        logger.info("[search_rag] BGE-M3 loaded: %s", _EMBED_MODEL)
+        device = _get_embed_device()
+        use_fp16 = device != "cpu"
+        try:
+            _embed_model = BGEM3FlagModel(_EMBED_MODEL, use_fp16=use_fp16, devices=[device])
+        except TypeError:
+            _embed_model = BGEM3FlagModel(_EMBED_MODEL, use_fp16=use_fp16)
+        logger.info("[search_rag] BGE-M3 loaded: %s device=%s", _EMBED_MODEL, device)
     return _embed_model
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        from FlagEmbedding import FlagReranker
+        device = _get_embed_device()
+        use_fp16 = device != "cpu"
+        try:
+            _reranker = FlagReranker(_RERANK_MODEL, use_fp16=use_fp16, device=device)
+        except TypeError:
+            _reranker = FlagReranker(_RERANK_MODEL, use_fp16=use_fp16)
+        logger.info("[search_rag] reranker loaded: %s device=%s", _RERANK_MODEL, device)
+    return _reranker
 
 
 def _get_qdrant():
@@ -138,7 +181,9 @@ def _get_qdrant():
     if _qdrant_client is None:
         from qdrant_client import AsyncQdrantClient
         _qdrant_client = AsyncQdrantClient(
-            host=_QDRANT_HOST, port=_QDRANT_PORT, prefer_grpc=True
+            host=_QDRANT_HOST, port=_QDRANT_PORT, prefer_grpc=True,
+            check_compatibility=False,
+            grpc_options=[("grpc.enable_http_proxy", 0)],
         )
         logger.info("[search_rag] Qdrant -> %s:%s (gRPC)", _QDRANT_HOST, _QDRANT_PORT)
     return _qdrant_client
@@ -165,12 +210,60 @@ async def _encode_query(query: str) -> tuple[list[float], dict]:
 
 # ── Tool 实现 ─────────────────────────────────────────────────────────────────
 
+import re as _re
+
+# 口语化特征词：匹配到任意一个则触发改写
+_COLLOQUIAL_RE = _re.compile(
+    r'我|你|他|她|咋|吗|呢|吧|怎么办|怎么回事|好不好|能不能|可以吗|有没有|是不是|'
+    r'管用|严不严重|要不要紧|肚子|嗓子|脑袋|拉肚|老是|总是|一直|'
+    r'什么原因|好难受|好痛|好痒|好疼|很厉害|死了'
+)
+
+
+def _needs_rewrite(query: str) -> bool:
+    """口语化特征检测：命中任一模式则需要改写，否则跳过改写节省 ~3s RTT。"""
+    return bool(_COLLOQUIAL_RE.search(query))
+
+
+async def _rewrite_query(query: str) -> str:
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(
+        api_key=os.environ["OPENAI_API_KEY"],
+        base_url=os.getenv("OPENAI_BASE_URL"),
+    )
+    resp = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        max_tokens=128,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是医疗检索优化器。将用户输入改写为适合向量数据库检索的标准医疗术语查询，"
+                    "只输出改写后的查询词，不加任何解释。"
+                ),
+            },
+            {"role": "user", "content": query},
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+
 async def _search_rag_once(query: str) -> str:
     """单次检索，不含重试逻辑。"""
+    import time as _time
     from qdrant_client.models import SparseVector, Prefetch, FusionQuery, Fusion
 
+    if _needs_rewrite(query):
+        t0 = _time.monotonic()
+        rewritten = await _rewrite_query(query)
+        rewrite_ms = int((_time.monotonic() - t0) * 1000)
+        logger.info("[search_rag] rewrite=yes original=%r rewritten=%r ms=%d",
+                    query, rewritten, rewrite_ms)
+    else:
+        rewritten = query
+        logger.info("[search_rag] rewrite=skip query=%r", query)
     client = _get_qdrant()
-    dense_vec, sparse_dict = await _encode_query(query)
+    dense_vec, sparse_dict = await _encode_query(rewritten)
     sparse_vec = SparseVector(
         indices=[int(k) for k in sparse_dict.keys()],
         values=[float(v) for v in sparse_dict.values()],
@@ -182,16 +275,26 @@ async def _search_rag_once(query: str) -> str:
             Prefetch(query=sparse_vec, using="sparse", limit=_PREFETCH_LIMIT),
         ],
         query=FusionQuery(fusion=Fusion.RRF),
-        limit=_TOP_K,
+        limit=_RERANK_POOL,
         with_payload=True,
     )
     hits = resp.points
     if not hits:
         return "[RAG] 未检索到相关内容。"
 
+    # cross-encoder 重排：在线程池中运行同步模型，避免阻塞事件循环
+    reranker = _get_reranker()
+    loop = asyncio.get_running_loop()
+    payloads = [h.payload for h in hits]
+    contents = [p.get("content", "") for p in payloads]
+    pairs = [[rewritten, c] for c in contents]
+    scores = await loop.run_in_executor(
+        None, lambda: reranker.compute_score(pairs, normalize=True)
+    )
+    ranked = sorted(zip(scores, payloads), key=lambda x: x[0], reverse=True)[:_TOP_K]
+
     parts: list[str] = []
-    for rank, hit in enumerate(hits, 1):
-        p = hit.payload
+    for rank, (score, p) in enumerate(ranked, 1):
         headings = " > ".join(
             h for h in [p.get("h1"), p.get("h2"), p.get("h3"), p.get("h4")] if h
         )
@@ -200,22 +303,33 @@ async def _search_rag_once(query: str) -> str:
             f"章节：{headings}\n"
             f"内容：{p.get('content', '')}"
         )
-    logger.info("[search_rag] query=%r returned=%d", query, len(hits))
+    logger.info("[search_rag] query=%r rrf=%d rerank→%d", query, len(hits), len(ranked))
     return "\n\n".join(parts)
 
 
 async def _search_rag(query: str) -> str:
     try:
-        return await _with_retry(_search_rag_once, query)
+        return await asyncio.wait_for(_with_retry(_search_rag_once, query), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.warning("[search_rag] timed out query=%r, falling back", query)
+        return "[RAG] 本地知识库检索超时，请改用 web_search 工具补充检索。"
     except Exception as exc:
-        logger.error("[search_rag] failed after retries: %s", exc, exc_info=True)
-        raise
+        err_str = str(exc).lower()
+        # collection 不存在或 Qdrant 未就绪，降级而非抛出
+        if any(k in err_str for k in ("not found", "doesn't exist", "collection", "unavailable", "connect")):
+            logger.warning("[search_rag] collection unavailable query=%r: %s", query, exc)
+            return "[RAG] 本地知识库暂不可用，请改用 web_search 工具补充检索。"
+        logger.error("[search_rag] failed: %s", exc, exc_info=True)
+        return "[RAG] 本地知识库检索失败，请改用 web_search 工具补充检索。"
 
 
 async def _search_memory(query: str, user_id: str = "") -> str:
     try:
-        cached = await SessionBuffer.get_mem_prefetch(user_id)
-        memories = cached if cached is not None else await Mem0Client(user_id=user_id).search(query, limit=5)
+        try:
+            memories = await Mem0Client(user_id=user_id).search(query, limit=5)
+        except asyncio.TimeoutError:
+            logger.warning("[search_memory] Mem0 超时，降级 prefetch user=%r", user_id)
+            memories = await SessionBuffer.get_mem_prefetch(user_id) or []
         lines = [f"- {m.get('memory') or m.get('content', '')}" for m in memories if m and (m.get('memory') or m.get('content'))]
         return "\n".join(lines) if lines else "未找到相关历史记录。"
     except Exception as exc:
@@ -224,7 +338,8 @@ async def _search_memory(query: str, user_id: str = "") -> str:
 
 
 async def _generate_report(user_id: str = "") -> str:
-    import anthropic as _anthropic
+    import json
+    from openai import AsyncOpenAI
     from pathlib import Path
 
     skill_dir = Path(__file__).parent / "skills" / "report_gen"
@@ -232,74 +347,74 @@ async def _generate_report(user_id: str = "") -> str:
 
     _skill_tools = [
         {
-            "name": "read_reference",
-            "description": "从 references/ 目录读取参考文件",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "filename": {"type": "string", "description": "文件名，如 output_format.md"},
+            "type": "function",
+            "function": {
+                "name": "read_reference",
+                "description": "从 references/ 目录读取参考文件",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string", "description": "文件名，如 output_format.md"},
+                    },
+                    "required": ["filename"],
                 },
-                "required": ["filename"],
             },
         },
         {
-            "name": "run_script",
-            "description": "运行 scripts/run.py 生成健康报告，返回最终 Markdown 文本",
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "required": [],
+            "type": "function",
+            "function": {
+                "name": "run_script",
+                "description": "运行 scripts/run.py 生成健康报告，返回最终 Markdown 文本",
+                "parameters": {"type": "object", "properties": {}, "required": []},
             },
         },
     ]
 
-    client = _anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
     messages = [
+        {
+            "role": "system",
+            "content": "你是 Skill 执行引擎，严格按 SKILL.md 步骤完成任务，不得偏离，不得自行推测结果。",
+        },
         {
             "role": "user",
             "content": f"执行以下 Skill，user_id={user_id!r}：\n\n{skill_md}",
-        }
+        },
     ]
 
     try:
         for _ in range(5):
-            response = await client.messages.create(
-                model=os.getenv("REPORT_MODEL", "claude-haiku-4-5-20251001"),
+            response = await client.chat.completions.create(
+                model=os.getenv("REPORT_MODEL", "gpt-4o-mini"),
                 max_tokens=2048,
-                system="你是 Skill 执行引擎，严格按 SKILL.md 步骤完成任务，不得偏离，不得自行推测结果。",
                 tools=_skill_tools,
                 messages=messages,
             )
 
-            if response.stop_reason == "end_turn":
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        return block.text
-                return "[报告生成失败] 未获得文本输出。"
+            choice = response.choices[0]
+            if choice.finish_reason == "stop":
+                return choice.message.content or "[报告生成失败] 未获得文本输出。"
 
-            # tool_use 轮：执行工具调用，结果追加后继续
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                if block.name == "read_reference":
-                    ref_path = skill_dir / "references" / block.input["filename"]
+            # tool_calls 轮：执行工具调用，结果追加后继续
+            messages.append(choice.message)
+            for tc in (choice.message.tool_calls or []):
+                args = json.loads(tc.function.arguments)
+                if tc.function.name == "read_reference":
+                    ref_path = skill_dir / "references" / args["filename"]
                     try:
                         content = ref_path.read_text(encoding="utf-8")
                     except FileNotFoundError:
-                        content = f"[错误] 文件不存在: {block.input['filename']}"
-                elif block.name == "run_script":
+                        content = f"[错误] 文件不存在: {args['filename']}"
+                elif tc.function.name == "run_script":
                     from agent.skills.report_gen.scripts.run import generate_report
                     content = await generate_report(user_id)
                 else:
-                    content = f"[错误] 未知工具: {block.name}"
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
+                    content = f"[错误] 未知工具: {tc.function.name}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
                     "content": content,
                 })
-            messages.append({"role": "user", "content": tool_results})
 
         logger.error("[generate_report] exceeded max rounds user=%r", user_id)
         return "[报告生成失败] 报告生成暂时不可用，请稍后重试。"
@@ -370,4 +485,4 @@ async def dispatch_tool(name: str, args: dict, user_id: str = "") -> tuple[str, 
     except Exception as exc:
         logger.error("[dispatch_tool] %s failed: %s", name, exc, exc_info=True)
 
-        return f"工具 {name} 暂时不可用，请根据已有知识作答。", True
+        return f"[工具错误] {name} 执行失败，请立即改用 web_search 工具补充检索，不得使用训练知识直接作答。", True

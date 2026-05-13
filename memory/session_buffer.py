@@ -42,14 +42,16 @@ class SessionBuffer:
             r = self._client()
             raw = await r.get(self.key)
             return json.loads(raw) if raw else []
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis get failed, using fallback key=%s: %s", self.key, exc)
             return _fallback.get(self.key, [])
 
     async def set(self, messages: list[dict]) -> None:
         try:
             r = self._client()
             await r.setex(self.key, SESSION_TTL, json.dumps(messages))
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis set failed, using fallback key=%s: %s", self.key, exc)
             _fallback[self.key] = messages
 
     async def append(self, message: dict) -> None:
@@ -61,7 +63,8 @@ class SessionBuffer:
         try:
             r = self._client()
             await r.delete(self.key)
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis delete failed, clearing fallback key=%s: %s", self.key, exc)
             _fallback.pop(self.key, None)
 
     # ── 问诊状态 ──────────────────────────────────────────────────────────────
@@ -76,26 +79,27 @@ class SessionBuffer:
             r = self._client()
             raw = await r.get(self._consult_key)
             return json.loads(raw) if raw else {"active": False, "history": []}
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis get_consult failed, using fallback key=%s: %s", self._consult_key, exc)
             return _consult_fallback.get(self._consult_key, {"active": False, "history": []})
 
     async def set_consult(self, state: dict) -> None:
         try:
             r = self._client()
             await r.setex(self._consult_key, SESSION_TTL, json.dumps(state))
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis set_consult failed, using fallback key=%s: %s", self._consult_key, exc)
             _consult_fallback[self._consult_key] = state
 
     async def clear_consult(self) -> None:
         try:
             r = self._client()
             await r.delete(self._consult_key)
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis clear_consult failed key=%s: %s", self._consult_key, exc)
             _consult_fallback.pop(self._consult_key, None)
 
     # ── memory_search 冷却计数器 ──────────────────────────────────────────────
-    # 调用 memory_search 后设置倒计时，后续几轮无需重复检索。
-    # 值含义：剩余可跳过轮数（0 = 冷却结束，需重新检索）
 
     @property
     def _mem_search_cooldown_key(self) -> str:
@@ -107,7 +111,8 @@ class SessionBuffer:
             r = self._client()
             val = await r.get(self._mem_search_cooldown_key)
             return int(val) if val else 0
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis get_cooldown failed key=%s: %s", self._mem_search_cooldown_key, exc)
             return 0
 
     async def set_mem_search_cooldown(self) -> None:
@@ -119,13 +124,10 @@ class SessionBuffer:
                 MEM_SEARCH_COOLDOWN_TTL,
                 str(MEM_SEARCH_COOLDOWN_TURNS),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis set_cooldown failed key=%s: %s", self._mem_search_cooldown_key, exc)
 
     # ── 记忆预热缓存（user 级别，跨 session 共享）────────────────────────────────
-    # 页面加载时触发 warmup，提前拉取全量记忆存入此缓存。
-    # memory_search 优先读取，命中则跳过 Mem0 / Zep 网络调用，消除冷启动延迟。
-    # TTL = 10 分钟，过期后自动回落到全量检索。
 
     @staticmethod
     def _prefetch_key(user_id: str) -> str:
@@ -133,24 +135,15 @@ class SessionBuffer:
 
     @staticmethod
     async def get_mem_prefetch(user_id: str) -> list[dict] | None:
-        """返回预热缓存的记忆列表；缓存不存在时返回 None。"""
+        """Mem0 超时降级缓存（写入由外部在 add 后调用）；不存在时返回 None。"""
         key = SessionBuffer._prefetch_key(user_id)
         try:
             r = aioredis.Redis(connection_pool=_pool)
             raw = await r.get(key)
             return json.loads(raw) if raw else None
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis get_prefetch failed user=%s: %s", user_id, exc)
             return None
-
-    @staticmethod
-    async def set_mem_prefetch(user_id: str, memories: list[dict]) -> None:
-        """写入预热缓存，TTL 10 分钟。"""
-        key = SessionBuffer._prefetch_key(user_id)
-        try:
-            r = aioredis.Redis(connection_pool=_pool)
-            await r.setex(key, 600, json.dumps(memories, ensure_ascii=False))
-        except Exception:
-            pass
 
     async def decrement_mem_search_cooldown(self) -> int:
         """每轮调用一次，计数器减 1，返回减后剩余值。"""
@@ -161,5 +154,70 @@ class SessionBuffer:
                 await r.delete(self._mem_search_cooldown_key)
                 return 0
             return new_val
-        except Exception:
+        except Exception as exc:
+            logger.warning("[session_buffer] Redis decrement_cooldown failed key=%s: %s", self._mem_search_cooldown_key, exc)
             return 0
+
+    # ── Mem0 待写队列（session 级别）──────────────────────────────────────────────
+
+    @property
+    def _mem_pending_key(self) -> str:
+        return f"mem_pending:{self.key}"
+
+    async def append_mem_pending(self, user_content: str, assistant_content: str) -> int:
+        """追加一轮对话到待写队列，返回当前队列长度（即已累积轮数）。"""
+        item = json.dumps({"user": user_content, "assistant": assistant_content}, ensure_ascii=False)
+        try:
+            r = self._client()
+            count = await r.rpush(self._mem_pending_key, item)
+            await r.expire(self._mem_pending_key, SESSION_TTL)
+            return count
+        except Exception as exc:
+            logger.warning("[session_buffer] append_mem_pending failed key=%s: %s", self._mem_pending_key, exc)
+            return 0
+
+    # ── 健康档案缓存（user 级别，Neo4j 查询结果）────────────────────────────────
+
+    _PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", "1800"))  # 默认 30 分钟
+
+    @staticmethod
+    async def get_profile_cache(user_id: str) -> list[dict] | None:
+        key = f"profile:{user_id}"
+        try:
+            r = aioredis.Redis(connection_pool=_pool)
+            raw = await r.get(key)
+            return json.loads(raw) if raw else None
+        except Exception as exc:
+            logger.warning("[session_buffer] get_profile_cache failed user=%s: %s", user_id, exc)
+            return None
+
+    @staticmethod
+    async def set_profile_cache(user_id: str, rows: list[dict]) -> None:
+        key = f"profile:{user_id}"
+        try:
+            r = aioredis.Redis(connection_pool=_pool)
+            await r.setex(key, SessionBuffer._PROFILE_CACHE_TTL,
+                          json.dumps(rows, ensure_ascii=False))
+        except Exception as exc:
+            logger.warning("[session_buffer] set_profile_cache failed user=%s: %s", user_id, exc)
+
+    @staticmethod
+    async def invalidate_profile_cache(user_id: str) -> None:
+        key = f"profile:{user_id}"
+        try:
+            r = aioredis.Redis(connection_pool=_pool)
+            await r.delete(key)
+        except Exception as exc:
+            logger.warning("[session_buffer] invalidate_profile_cache failed user=%s: %s", user_id, exc)
+
+    async def drain_mem_pending(self) -> list[dict]:
+        """取出并清空待写队列，返回所有轮次的 {user, assistant} 列表。"""
+        try:
+            r = self._client()
+            items = await r.lrange(self._mem_pending_key, 0, -1)
+            if items:
+                await r.delete(self._mem_pending_key)
+            return [json.loads(i) for i in items] if items else []
+        except Exception as exc:
+            logger.warning("[session_buffer] drain_mem_pending failed key=%s: %s", self._mem_pending_key, exc)
+            return []
