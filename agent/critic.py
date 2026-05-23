@@ -15,13 +15,26 @@ Hook 3: update_badcase(user_message, assistant_response) → None（fire-and-for
   位置：on_stop_hook，异步后台
   实现：LLM 判断合规性，不合规写入 critic_failures.jsonl
   作用：更新下次请求 system prompt 里的反例，不影响当前回复
+
+可观测性:
+  - grounding_check: 独立 Span + critic 指标
+  - update_badcase: fire-and-forget Span (通过 trace context 链回主 trace)
+  - critic 拦截率是输出质量的先行指标
+
+面试要点:
+  - Critic 是 Agent 输出质量的最后一道防线
+  - grounding(幻觉检测)和 compliance(合规审查)是两个独立的维度
+  - 拦截率突然上升 → 模型行为变化或检索质量下降
 """
 import json
 import logging
 import re
+import time
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+
+from agent.telemetry import get_tracer, mark_span_ok, mark_span_error
 
 logger = logging.getLogger(__name__)
 
@@ -76,17 +89,21 @@ _GROUNDING_PROMPT = """你是医疗内容溯源审查员。
 
 
 async def grounding_check(assistant_text: str, tool_contents: dict[str, str]) -> str | None:
-    """
-    用 tool_contents（RAG/web 返回原文）核实回复中的具体数据引用。
-    无 tool_contents 时跳过（模型未调用检索工具，无法溯源）。
-    返回 None 表示通过；否则返回需要追加的警告文字。
-    """
     grounding_sources = {
         k: v for k, v in tool_contents.items()
         if k in ("search_rag", "web_search") and v
     }
     if not grounding_sources:
         return None
+
+    tracer = get_tracer()
+    span = tracer.start_span("critic.grounding_check")
+    span.set_attributes({
+        "critic.assistant_len": len(assistant_text),
+        "critic.sources": list(grounding_sources.keys()),
+    })
+
+    t0 = time.monotonic()
 
     context = "\n\n---\n\n".join(
         f"【{name} 返回原文】\n{text[:1500]}"
@@ -99,16 +116,29 @@ async def grounding_check(assistant_text: str, tool_contents: dict[str, str]) ->
             SystemMessage(content=_GROUNDING_PROMPT),
             HumanMessage(content=content),
         ])
+        ms = int((time.monotonic() - t0) * 1000)
+        span.set_attribute("critic.ms", ms)
+
         raw = resp.content.strip()
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if not m:
+            mark_span_ok(span)
+            span.end()
             return None
+
         result = json.loads(m.group())
+        passed = not result.get("pass")
+        span.set_attribute("critic.passed", passed)
+        mark_span_ok(span)
+        span.end()
+
         if not result.get("pass") and result.get("note"):
             logger.info("[critic/grounding] triggered: %s", result["note"][:80])
             return result["note"]
     except Exception as exc:
         logger.warning("[critic/grounding] check failed: %s", exc)
+        mark_span_error(span, exc)
+        span.end()
 
     return None
 
@@ -127,11 +157,13 @@ _COMPLIANCE_PROMPT = """你是医疗健康助手的质量审查员。检查助�
 
 
 async def update_badcase(user_message: str, assistant_response: str) -> None:
-    """
-    合规性审查，fire-and-forget。
-    不合规时只写入 critic_failures.jsonl，不追加任何内容到回复。
-    下次请求构建 system prompt 时读取，注入为反例。
-    """
+    tracer = get_tracer()
+    span = tracer.start_span("critic.compliance")
+    span.set_attributes({
+        "critic.msg_len": len(user_message),
+        "critic.reply_len": len(assistant_response),
+    })
+
     try:
         content = f"用户消息：{user_message}\n\n助手回复：{assistant_response}"
         resp = await _llm.ainvoke([
@@ -141,17 +173,28 @@ async def update_badcase(user_message: str, assistant_response: str) -> None:
         raw = resp.content.strip()
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if not m:
+            mark_span_ok(span)
+            span.end()
             return
         result = json.loads(m.group())
-        if not result.get("pass") and result.get("note"):
+        passed = result.get("pass", True)
+        span.set_attribute("critic.passed", passed)
+
+        if not passed and result.get("note"):
             from agent.critic_store import write_failure
             write_failure(user_message, assistant_response, result["note"])
             logger.info("[critic/compliance] badcase recorded: %s", result["note"][:80])
+            span.set_attribute("critic.note", result["note"][:100])
+
+        mark_span_ok(span)
     except Exception as exc:
         logger.warning("[critic/compliance] failed: %s", exc)
+        mark_span_error(span, exc)
+    finally:
+        span.end()
 
 
-# ── 向后兼容：harness 旧调用入口（保留签名，内部只走 grounding_check）────────
+# ── 向后兼容：harness 旧调用入口 ─────────────────────────────────────────────
 
 async def critic_review(user_message: str, assistant_response: str) -> str | None:
     """旧入口，harness 重构前的临时兼容层。新代码直接调用三个独立函数。"""

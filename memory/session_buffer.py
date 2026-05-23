@@ -6,6 +6,15 @@ import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
 
+
+def _m_inc_degrade(operation: str):
+    try:
+        from agent.metrics import redis_degradation
+        redis_degradation.labels(operation=operation).inc()
+    except Exception:
+        pass
+
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 
@@ -44,6 +53,7 @@ class SessionBuffer:
             return json.loads(raw) if raw else []
         except Exception as exc:
             logger.warning("[session_buffer] Redis get failed, using fallback key=%s: %s", self.key, exc)
+            _m_inc_degrade("session_load")
             return _fallback.get(self.key, [])
 
     async def set(self, messages: list[dict]) -> None:
@@ -52,6 +62,7 @@ class SessionBuffer:
             await r.setex(self.key, SESSION_TTL, json.dumps(messages))
         except Exception as exc:
             logger.warning("[session_buffer] Redis set failed, using fallback key=%s: %s", self.key, exc)
+            _m_inc_degrade("session_save")
             _fallback[self.key] = messages
 
     async def append(self, message: dict) -> None:
@@ -81,6 +92,7 @@ class SessionBuffer:
             return json.loads(raw) if raw else {"active": False, "history": []}
         except Exception as exc:
             logger.warning("[session_buffer] Redis get_consult failed, using fallback key=%s: %s", self._consult_key, exc)
+            _m_inc_degrade("consult_load")
             return _consult_fallback.get(self._consult_key, {"active": False, "history": []})
 
     async def set_consult(self, state: dict) -> None:
@@ -89,6 +101,7 @@ class SessionBuffer:
             await r.setex(self._consult_key, SESSION_TTL, json.dumps(state))
         except Exception as exc:
             logger.warning("[session_buffer] Redis set_consult failed, using fallback key=%s: %s", self._consult_key, exc)
+            _m_inc_degrade("consult_save")
             _consult_fallback[self._consult_key] = state
 
     async def clear_consult(self) -> None:

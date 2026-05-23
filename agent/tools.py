@@ -9,11 +9,41 @@ generate_report : 生成个人健康摘要报告
 import asyncio
 import logging
 import os
+import hashlib
 
 from memory.mem0_client import Mem0Client
 from memory.session_buffer import SessionBuffer
 
 logger = logging.getLogger(__name__)
+
+# ── Metric helpers ─────────────────────────────────────────────────────────────
+
+def _m_inc(name: str, **labels):
+    try:
+        import importlib
+        m = importlib.import_module("agent.metrics")
+        metric = getattr(m, name)
+        if labels:
+            metric = metric.labels(**labels)
+        metric.inc()
+    except Exception:
+        pass
+
+
+def _m_observe(name: str, value: float, **labels):
+    try:
+        import importlib
+        m = importlib.import_module("agent.metrics")
+        metric = getattr(m, name)
+        if labels:
+            metric = metric.labels(**labels)
+        metric.observe(value)
+    except Exception:
+        pass
+
+
+def _query_hash(query: str) -> str:
+    return hashlib.md5(query.encode()).hexdigest()[:12]
 
 # 可重试的瞬时异常类型（网络超时、连接中断）
 _TRANSIENT_EXCEPTIONS = (OSError, ConnectionError, TimeoutError)
@@ -324,13 +354,19 @@ async def _search_rag(query: str) -> str:
 
 
 async def _search_memory(query: str, user_id: str = "", limit: int = 5) -> str:
+    cache_hit = False
     try:
         try:
             memories = await Mem0Client(user_id=user_id).search(query, limit=limit)
         except asyncio.TimeoutError:
             logger.warning("[search_memory] Mem0 超时，降级 prefetch user=%r", user_id)
             memories = await SessionBuffer.get_mem_prefetch(user_id) or []
+            cache_hit = True
         lines = [f"- {m.get('memory') or m.get('content', '')}" for m in memories if m and (m.get('memory') or m.get('content'))]
+        logger.info("[search_memory] user=%r query_hash=%s limit=%d results=%d cache=%s",
+                    user_id, _query_hash(query), limit, len(lines), cache_hit,
+                    extra={"tool": "search_memory", "query_hash": _query_hash(query),
+                           "cache_hit": cache_hit, "result_count": len(lines)})
         return "\n".join(lines) if lines else "未找到相关历史记录。"
     except Exception as exc:
         logger.error("[search_memory] failed user=%r: %s", user_id, exc, exc_info=True)
