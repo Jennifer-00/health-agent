@@ -1,25 +1,31 @@
 """
-Observability — Harness 的结构化日志层。
+Observability — 本地 JSONL 追踪 (OTEL 的补充，不是替代)。
+
+定位:
+  - OTEL (telemetry.py) → 分布式 Trace，上报 Jaeger/Tempo
+  - Prometheus (metrics.py) → 聚合指标，Grafana 面板 + 告警
+  - 本模块 → 本地 JSONL，开发期 grep 调试 + OTEL 不可用时的 fallback
 
 设计参考 AgentTrace (arxiv 2602.10133) 的三观测面模型：
   - operational : 方法调用层面（节点进入/退出、耗时）
   - cognitive   : LLM 认知层面（prompt tokens、工具请求数）
   - contextual  : 外部系统交互层面（工具执行耗时、结果长度）
 
-所有事件写入 JSONL，字段统一：
-  trace_id / surface / event / node / ms / ...
-trace_id 由 AgentHarness 在每次请求开始时生成，
-通过装饰器参数注入，使 triage → graph → critic 三层日志可关联查询。
+三观测面现在体现为 Span 的 "surface" 属性，不再是独立日志流。
+每个 Span 可以同时属于多个面——例如 search_memory span：
+  - 它的 duration 属于 operational 面
+  - 它的 result_len 属于 contextual 面
+  - 它触发的 query rewrite LLM 调用属于 cognitive 面
+
+面试要点:
+  - 三观测面是概念模型，不是物理存储。物理上按 Span Tree 组织，按面过滤
+  - JSONL 是 OTEL 的补充不是对立——开发时 tail -f JSONL，生产时查 Jaeger
 """
-import functools
 import json
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
-# 日志文件路径，可通过环境变量覆盖
 _LOG_DIR = Path(__file__).parent.parent / "logs"
 _LOG_FILE = _LOG_DIR / "agent_trace.jsonl"
 
@@ -38,7 +44,7 @@ def _emit(record: dict) -> None:
     print(f"[trace] {line}")
 
 
-# ── 三个观测面的直接日志函数 ─────────────────────────────────────────────────
+# ── 三个观测面的日志函数 (保留供开发调试 + OTEL fallback) ────────────────────
 
 def log_pipeline_event(trace_id: str, event: str, **kwargs) -> None:
     """operational 面：pipeline 阶段事件（triage/agent/critic 进入与完成）。"""
@@ -71,7 +77,7 @@ def log_tool_use(
     tool: str,
     ms: int,
     result_len: int,
-    mode: str = "sync",  # "sync" | "background"
+    mode: str = "sync",
 ) -> None:
     """contextual 面：工具执行耗时与结果长度。"""
     _emit({
@@ -85,66 +91,7 @@ def log_tool_use(
     })
 
 
-# ── 装饰器：非侵入式包装 LangGraph 节点 ──────────────────────────────────────
-# 参考 AgentTrace 的 decorator injection pattern：
-# 在 harness 层 wrap 节点函数，不修改 nodes.py 内部代码。
-
-def trace_llm_node(node_name: str, trace_id_getter: Callable[[], str]):
-    """
-    装饰 orchestrator_node 等 LLM 节点。
-    自动打 cognitive 面日志：耗时、token 数、工具请求列表。
-    """
-    def decorator(fn):
-        @functools.wraps(fn)
-        async def wrapper(state, *args, **kwargs):
-            t0 = time.monotonic()
-            result = await fn(state, *args, **kwargs)
-            ms = int((time.monotonic() - t0) * 1000)
-
-            trace_id = trace_id_getter()
-            # 从节点输出里提取 token 使用量（LangChain AIMessage 携带 usage_metadata）
-            tokens_input, tokens_output = 0, 0
-            tools_requested: list[str] = []
-
-            messages = result.get("messages", []) if isinstance(result, dict) else []
-            if messages:
-                last = messages[-1]
-                meta = getattr(last, "usage_metadata", None)
-                if meta:
-                    tokens_input = meta.get("input_tokens", 0)
-                    tokens_output = meta.get("output_tokens", 0)
-                tool_calls = getattr(last, "tool_calls", None) or []
-                tools_requested = [tc["name"] for tc in tool_calls]
-
-            log_llm_call(
-                trace_id=trace_id,
-                node=node_name,
-                tokens_input=tokens_input,
-                tokens_output=tokens_output,
-                ms=ms,
-                tools_requested=tools_requested,
-            )
-            return result
-        return wrapper
-    return decorator
-
-
-def trace_tool_node(trace_id_getter: Callable[[], str]):
-    """
-    装饰 tool_executor_node。
-    自动打 contextual 面日志：每个工具的耗时与结果长度。
-    """
-    def decorator(fn):
-        @functools.wraps(fn)
-        async def wrapper(state, *args, **kwargs):
-            t0 = time.monotonic()
-            result = await fn(state, *args, **kwargs)
-            ms = int((time.monotonic() - t0) * 1000)
-
-            return result
-        return wrapper
-    return decorator
-
+# ── Trace ID 生成 ──────────────────────────────────────────────────────────────
 
 def new_trace_id() -> str:
     """生成一个新的 trace_id，供 AgentHarness 在请求开始时调用。"""

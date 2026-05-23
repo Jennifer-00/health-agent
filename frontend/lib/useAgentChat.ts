@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
+import { authHeaders, clearToken } from "@/lib/auth";
 
 export interface Message {
   role: "user" | "assistant";
   content: string;
+  intent?: string;
 }
 
 export interface ToolEvent {
@@ -10,19 +12,43 @@ export interface ToolEvent {
   summary: string;
 }
 
+export interface ToolResult {
+  tool: string;
+  preview: string;
+}
+
 export function useAgentChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const [toolResultMap, setToolResultMap] = useState<Record<string, string>>({});
   const [isStreaming, setIsStreaming] = useState(false);
   const [statusText, setStatusText] = useState<string>("");
   const [isConsulting, setIsConsulting] = useState(false);
   const [emergencyText, setEmergencyText] = useState<string | null>(null);
-  const [sessionId] = useState(() => `web-${Date.now()}`);
+  const [sessionId] = useState(() => `web-${crypto.randomUUID()}`);
 
   // 页面加载时触发后端记忆预热，消除首条消息的冷启动延迟
   useEffect(() => {
-    fetch("/api/chat/warmup", { method: "POST" }).catch(() => {});
+    fetch("/api/chat/warmup", { method: "POST", headers: authHeaders() }).catch(() => {});
   }, []);
+
+  // 关闭页面或组件卸载时，将剩余未写入的对话 flush 到 Mem0
+  useEffect(() => {
+    const flushSession = () => {
+      fetch("/api/chat/end", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ session_id: sessionId }),
+        keepalive: true,
+      }).catch(() => {});
+    };
+
+    window.addEventListener("beforeunload", flushSession);
+    return () => {
+      window.removeEventListener("beforeunload", flushSession);
+      flushSession();
+    };
+  }, [sessionId]);
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -32,9 +58,15 @@ export function useAgentChat() {
 
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ message: text, session_id: sessionId }),
       });
+
+      if (res.status === 401) {
+        clearToken();
+        window.location.replace("/login");
+        return;
+      }
 
       if (!res.body) {
         setIsStreaming(false);
@@ -84,11 +116,25 @@ export function useAgentChat() {
                 };
                 return updated;
               });
+            } else if (payload.type === "intent") {
+              setMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role === "assistant") {
+                  updated[updated.length - 1] = { ...last, intent: payload.intent };
+                }
+                return updated;
+              });
             } else if (payload.type === "tool_call") {
               setToolEvents((prev) => [
                 ...prev,
                 { tool: payload.tool, summary: payload.summary },
               ]);
+            } else if (payload.type === "tool_result") {
+              setToolResultMap((prev) => ({
+                ...prev,
+                [payload.tool]: payload.preview,
+              }));
             } else if (payload.type === "done") {
               setStatusText("");
               setIsStreaming(false);
@@ -152,5 +198,14 @@ export function useAgentChat() {
     setEmergencyText(null);
   }, [emergencyText]);
 
-  return { messages, toolEvents, sendMessage, isStreaming, statusText, isConsulting, emergencyText, dismissEmergency };
+  // 手动立即写入记忆：flush 当前 session 的 pending 轮次，轮数清零重新计
+  const flushMemory = useCallback(async () => {
+    await fetch("/api/chat/end", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+  }, [sessionId]);
+
+  return { messages, toolEvents, toolResultMap, sendMessage, isStreaming, statusText, isConsulting, emergencyText, dismissEmergency, flushMemory };
 }

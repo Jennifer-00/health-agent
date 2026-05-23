@@ -1,13 +1,16 @@
+import logging
 import operator
 from typing import Annotated, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from agent.prompts import INTAKE_PROMPT
 
-_llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=512)
+logger = logging.getLogger(__name__)
+
+_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=512)
 
 
 class IntakeState(TypedDict):
@@ -17,6 +20,7 @@ class IntakeState(TypedDict):
 
 
 async def intake_node(state: IntakeState) -> dict:
+    turns = len([m for m in state["messages"] if isinstance(m, HumanMessage)])
     system = SystemMessage(content=INTAKE_PROMPT)
     response = await _llm.ainvoke([system] + state["messages"])
     raw = response.content if isinstance(response.content, str) else ""
@@ -25,12 +29,14 @@ async def intake_node(state: IntakeState) -> dict:
         before, _, after = raw.partition("[INTAKE_DONE]")
         summary = after.strip()
         display = before.strip() or "好的，信息收集完毕，正在为您分析…"
+        logger.info("[intake] done turns=%d summary_len=%d", turns, len(summary))
         return {
             "messages": [AIMessage(content=display)],
             "done": True,
             "summary": summary,
         }
 
+    logger.info("[intake] ongoing turns=%d", turns)
     return {"messages": [response], "done": False, "summary": ""}
 
 

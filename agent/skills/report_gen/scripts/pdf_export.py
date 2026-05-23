@@ -1,12 +1,6 @@
-"""Markdown 健康报告 → PDF bytes（Playwright headless Chromium 渲染）。
-
-Windows 上 uvicorn 的 asyncio loop 不支持直接 spawn 子进程，
-所以用 sync_playwright + asyncio.to_thread 跑在线程池里规避该限制。
-"""
-import asyncio
-
+"""Markdown 健康报告 → PDF bytes（Playwright headless Chromium 渲染）。"""
 import markdown
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 _CSS = """
 body {
@@ -33,21 +27,6 @@ p { margin: 6px 0; }
 """
 
 
-def _render_pdf(full_html: str) -> bytes:
-    """在同步线程里启动 Chromium，渲染 HTML 并输出 PDF bytes。"""
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        page.set_content(full_html, wait_until="networkidle")
-        pdf_bytes = page.pdf(
-            format="A4",
-            margin={"top": "20px", "right": "20px", "bottom": "20px", "left": "20px"},
-            print_background=True,
-        )
-        browser.close()
-    return pdf_bytes
-
-
 async def markdown_to_pdf(md_text: str) -> bytes:
     html_body = markdown.markdown(
         md_text,
@@ -61,4 +40,15 @@ async def markdown_to_pdf(md_text: str) -> bytes:
 </head>
 <body>{html_body}</body>
 </html>"""
-    return await asyncio.to_thread(_render_pdf, full_html)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.set_content(full_html, wait_until="networkidle")
+        pdf_bytes = await page.pdf(
+            format="A4",
+            margin={"top": "20px", "right": "20px", "bottom": "20px", "left": "20px"},
+            print_background=True,
+        )
+        await browser.close()
+    return pdf_bytes

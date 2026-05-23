@@ -15,7 +15,7 @@ export async function PATCH(req: Request, { params }: Params): Promise<Response>
     headers: {
       "Content-Type": contentType,
     },
-  });
+  }, req);
 
   return new Response(await upstream.text(), {
     status: upstream.status,
@@ -32,7 +32,7 @@ export async function DELETE(req: Request, { params }: Params): Promise<Response
 
   const upstream = await proxyToBackend(`/memory/${memoryId}?source=${source}`, {
     method: "DELETE",
-  });
+  }, req);
 
   return new Response(await upstream.text(), {
     status: upstream.status,

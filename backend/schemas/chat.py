@@ -20,3 +20,7 @@ class MemoryItem(BaseModel):
     category: Optional[str] = None
     record_date: Optional[str] = None
     source: Literal["mem0", "db"]
+
+
+class MemoryImportRequest(BaseModel):
+    text: str
